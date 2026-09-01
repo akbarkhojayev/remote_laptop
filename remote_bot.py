@@ -21,9 +21,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# O'z ma'lumotlaringizni kiriting
-BOT_TOKEN = "SIZNING_BOT_TOKENINGIZ"
-ADMIN_ID = 123456789  # Telegram ID raqamingiz
+# Telegram ma'lumotlari
+BOT_TOKEN = "8930960513:AAFcGZfimSz3WtgEmsTc7iwj8rTQAUjLNY4"
+ADMIN_ID = 8200157886
 
 UZ_TZ = ZoneInfo("Asia/Tashkent")
 TRACK_INTERVAL_SECONDS = 60  # Har 1 daqiqada faol dasturni hisoblaydi
@@ -44,10 +44,6 @@ class ClipboardState(StatesGroup):
 # ---------- KUNLIK STATISTIKA ----------
 daily_stats = {}
 
-IGNORE_APPS = {
-    "org.gnome.shell", "gnome-shell", "desktop", "mutter", "", "unknown"
-}
-
 
 def reset_daily_stats():
     daily_stats["date"] = datetime.now(UZ_TZ).strftime("%Y-%m-%d")
@@ -55,7 +51,7 @@ def reset_daily_stats():
     daily_stats["battery_samples"] = []
 
 
-# ---------- KLAVIATURA ----------
+# ---------- ASOSIY MENYU (REPLY TUGMALAR) ----------
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Holat"), KeyboardButton(text="📸 Kamera")],
@@ -67,6 +63,7 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+# ---------- INLINE KLAVIATURALAR ----------
 volume_kb = InlineKeyboardMarkup(
     inline_keyboard=[
         [
@@ -98,7 +95,7 @@ def confirm_kb(action: str) -> InlineKeyboardMarkup:
     )
 
 
-# ---------- WAYLAND MUHITI VA FUNKSIYALAR ----------
+# ---------- WAYLAND MUHITI VA TIZIM FUNKSIYALARI ----------
 def get_wayland_env():
     uid = os.getuid()
     env = os.environ.copy()
@@ -109,6 +106,7 @@ def get_wayland_env():
 
 
 def get_wifi_name() -> str:
+    """Ulangan Wi-Fi SSID nomini aniqlaydi."""
     try:
         output = subprocess.check_output(["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"], timeout=3).decode()
         for line in output.splitlines():
@@ -160,11 +158,38 @@ def run_volume_action(arg: str) -> str:
 
 
 def get_active_window_name() -> str:
-    """Wayland / GNOME Shell muhitida ayni paytda ochiq va faol dasturni aniqlaydi."""
+    """GNOME Shell API orqali ayni paytda fokusda turgan dastur nomini aniq oladi."""
     env = get_wayland_env()
-    app_name = ""
+    
+    # 1. GNOME Shell ichki Eval API orqali haqiqiy ochiq dasturni olish
+    js_code = (
+        "(() => {"
+        "  let win = global.display.focus_window;"
+        "  if (!win) return '';"
+        "  let tracker = Shell.WindowTracker.get_default();"
+        "  let app = tracker.get_window_app(win);"
+        "  return app ? app.get_name() : (win.get_wm_class() || win.get_title());"
+        "})()"
+    )
+    
+    try:
+        cmd = [
+            "gdbus", "call", "--session",
+            "--dest", "org.gnome.Shell",
+            "--object-path", "/org/gnome/Shell",
+            "--method", "org.gnome.Shell.Eval",
+            js_code
+        ]
+        out = subprocess.check_output(cmd, env=env, timeout=2).decode()
+        match = re.search(r"\(true,\s*'(.*?)'\)", out)
+        if match and match.group(1):
+            name = match.group(1).strip()
+            if name:
+                return name
+    except Exception:
+        pass
 
-    # 1. GNOME Shell Introspect DBus orqali ochiq oynalarni o'qish (Wayland standarti)
+    # 2. Zaxira: org.gnome.Shell.Introspect orqali tekshirish
     try:
         res = subprocess.check_output([
             "gdbus", "call", "--session",
@@ -173,58 +198,16 @@ def get_active_window_name() -> str:
             "--method", "org.gnome.Shell.Introspect.GetWindows"
         ], env=env, timeout=2).decode()
 
-        # JSON strukturasini ajratib olish
         match = re.search(r'(\{.*\})', res)
         if match:
             data = json.loads(match.group(1))
             for win_id, props in data.items():
                 if props.get("has-focus") is True:
-                    app_name = props.get("wm-class", "") or props.get("title", "")
-                    break
+                    return props.get("title") or props.get("wm-class") or "Noma'lum"
     except Exception:
         pass
 
-    # 2. Zaxira: Agar yuqoridagi usul bermasa, foydalanuvchi GUI jarayonlari orqali
-    if not app_name:
-        current_uid = os.getuid()
-        for p in psutil.process_iter(["name", "uids", "cmdline"]):
-            try:
-                info = p.info
-                if info.get("uids") and info["uids"].real == current_uid:
-                    cmd = " ".join(info.get("cmdline") or []).lower()
-                    if "chrome" in cmd:
-                        app_name = "google-chrome"
-                        break
-                    elif "telegram" in cmd:
-                        app_name = "telegram-desktop"
-                        break
-                    elif "pycharm" in cmd:
-                        app_name = "pycharm"
-                        break
-                    elif "code" in cmd:
-                        app_name = "code"
-                        break
-            except Exception:
-                continue
-
-    name_map = {
-        "google-chrome": "Google Chrome",
-        "google-chrome-stable": "Google Chrome",
-        "telegramdesktop": "Telegram",
-        "org.telegram.desktop": "Telegram",
-        "telegram-desktop": "Telegram",
-        "code": "VS Code",
-        "pycharm": "PyCharm",
-        "pycharm-community": "PyCharm",
-        "gnome-terminal-server": "Terminal",
-        "org.gnome.terminal": "Terminal",
-        "org.gnome.nautilus": "Fayllar (Nautilus)",
-        "firefox": "Firefox",
-        "vlc": "VLC Player",
-    }
-
-    clean = app_name.lower().strip()
-    return name_map.get(clean, app_name.replace("-", " ").capitalize() if app_name else "Bosh ekran")
+    return "Bosh ekran"
 
 
 def build_status_text() -> str:
@@ -283,7 +266,7 @@ def build_daily_report_text() -> str:
     top_apps = stats.get("app_minutes", Counter()).most_common(6)
     apps_lines = []
     for i, (name, count) in enumerate(top_apps):
-        if name in ("Bosh ekran", ""):
+        if name in ("Bosh ekran", "", "Noma'lum"):
             continue
         h = count // 60
         m = count % 60
@@ -304,7 +287,6 @@ def build_daily_report_text() -> str:
     )
 
 
-# ---------- WAYLAND CLIPBOARD (wl-paste va wl-copy) ----------
 def get_clipboard_text():
     env = get_wayland_env()
     try:
@@ -319,7 +301,7 @@ def set_clipboard_text(text: str):
     subprocess.run(["wl-copy", text], env=env, timeout=3, check=True)
 
 
-# ---------- XAVFSIZLIK ----------
+# ---------- XAVFSIZLIK FILTRI ----------
 @dp.message(F.from_user.id != ADMIN_ID)
 async def unauthorized(message: types.Message):
     await message.reply("⛔️ Ruxsat berilmagan!")
@@ -333,7 +315,11 @@ async def unauthorized_callback(callback: CallbackQuery):
 # ---------- ASOSIY BUYRUQLAR ----------
 @dp.message(Command("start", "help"))
 async def cmd_start(message: types.Message):
-    await message.answer("🤖 <b>Masofaviy Boshqaruv Markazi</b>\nQuyidagi menyudan foydalaning 👇", parse_mode="HTML", reply_markup=main_menu)
+    await message.answer(
+        "🤖 <b>Masofaviy Boshqaruv Markazi</b>\nQuyidagi menyudan foydalaning 👇",
+        parse_mode="HTML",
+        reply_markup=main_menu
+    )
 
 
 @dp.message(Command("status"))
@@ -350,7 +336,7 @@ async def cmd_report(message: types.Message):
 @dp.message(Command("photo"))
 @dp.message(F.text == "📸 Kamera")
 async def cmd_photo(message: types.Message):
-    msg = await message.answer("📸 Surat olinmoqda (fokus sozlanmoqda)...")
+    msg = await message.answer("📸 Surat olinmoqda...")
     cam_file = "/tmp/cam_shot.jpg"
 
     if os.path.exists(cam_file):
@@ -502,7 +488,7 @@ async def cancel_action(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------- FONDA DASTURLARNI KUZATISH ----------
+# ---------- FONDA DASTURLARNI DAQIQAMA-DAQIQA KUZATISH ----------
 async def app_tracker_loop():
     while True:
         try:
@@ -518,7 +504,7 @@ async def app_tracker_loop():
                 })
 
             current_app = get_active_window_name()
-            if current_app and current_app not in ("Bosh ekran", ""):
+            if current_app and current_app not in ("Bosh ekran", "", "Noma'lum"):
                 daily_stats["app_minutes"][current_app] += 1
         except Exception:
             pass
