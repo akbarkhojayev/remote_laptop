@@ -21,9 +21,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Telegram ma'lumotlari
-BOT_TOKEN = "8930960513:AAFcGZfimSz3WtgEmsTc7iwj8rTQAUjLNY4"
-ADMIN_ID = 8200157886
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 UZ_TZ = ZoneInfo("Asia/Tashkent")
 TRACK_INTERVAL_SECONDS = 60  # Har 1 daqiqada faol dasturni hisoblaydi
@@ -44,6 +43,12 @@ class ClipboardState(StatesGroup):
 # ---------- KUNLIK STATISTIKA ----------
 daily_stats = {}
 
+# Tizimning nofaol oynalari
+SYSTEM_IGNORE_CLASSES = {
+    "org.gnome.shell", "gnome-shell", "desktop", "mutter",
+    "mutter-x11-frames", "mutter-guard-window", "dock", ""
+}
+
 
 def reset_daily_stats():
     daily_stats["date"] = datetime.now(UZ_TZ).strftime("%Y-%m-%d")
@@ -51,7 +56,7 @@ def reset_daily_stats():
     daily_stats["battery_samples"] = []
 
 
-# ---------- ASOSIY MENYU (REPLY TUGMALAR) ----------
+# ---------- ASOSIY MENYU ----------
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Holat"), KeyboardButton(text="📸 Kamera")],
@@ -63,7 +68,6 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# ---------- INLINE KLAVIATURALAR ----------
 volume_kb = InlineKeyboardMarkup(
     inline_keyboard=[
         [
@@ -106,7 +110,6 @@ def get_wayland_env():
 
 
 def get_wifi_name() -> str:
-    """Ulangan Wi-Fi SSID nomini aniqlaydi."""
     try:
         output = subprocess.check_output(["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"], timeout=3).decode()
         for line in output.splitlines():
@@ -157,55 +160,142 @@ def run_volume_action(arg: str) -> str:
     return text
 
 
-def get_active_window_name() -> str:
-    """GNOME Shell API orqali ayni paytda fokusda turgan dastur nomini aniq oladi."""
+def clean_app_name(raw_name: str) -> str:
+    """Ilova nomini toza va chiroyli formatga keltiradi."""
+    if not raw_name:
+        return "Bosh ekran"
+
+    # Keng tarqalgan ilovalarni chiroyli qilish
+    mapping = {
+        "google-chrome": "Google Chrome",
+        "google-chrome-stable": "Google Chrome",
+        "telegramdesktop": "Telegram",
+        "org.telegram.desktop": "Telegram",
+        "telegram-desktop": "Telegram",
+        "code": "VS Code",
+        "code - oss": "VS Code",
+        "visual-studio-code": "VS Code",
+        "jetbrains-pycharm": "PyCharm",
+        "jetbrains-pycharm-ce": "PyCharm",
+        "pycharm": "PyCharm",
+        "pycharm-community": "PyCharm",
+        "gnome-terminal-server": "Terminal",
+        "org.gnome.terminal": "Terminal",
+        "org.gnome.ptyxis": "Terminal",
+        "org.gnome.nautilus": "Fayllar (Nautilus)",
+        "firefox": "Firefox",
+        "vlc": "VLC Player",
+        "antigravity": "Antigravity",
+    }
+
+    clean = raw_name.lower().strip()
+    if clean in mapping:
+        return mapping[clean]
+
+    # Nuqta bilan boshlangan ID larni oxirgi qismini olish (masalan: com.example.App -> App)
+    if "." in raw_name:
+        parts = raw_name.split(".")
+        candidate = parts[-1]
+        if candidate.lower() not in ("desktop", "exe"):
+            return candidate.capitalize()
+
+    return raw_name.replace("-", " ").replace("_", " ").capitalize()
+
+
+def get_focused_window_via_extension():
+    """GNOME 'Window Calls' extension orqali fokusdagi oynani aniqlaydi.
+    Talab: window-calls@domandoman.xyz extension yoqilgan bo'lishi kerak.
+    """
     env = get_wayland_env()
-    
-    # 1. GNOME Shell ichki Eval API orqali haqiqiy ochiq dasturni olish
-    js_code = (
-        "(() => {"
-        "  let win = global.display.focus_window;"
-        "  if (!win) return '';"
-        "  let tracker = Shell.WindowTracker.get_default();"
-        "  let app = tracker.get_window_app(win);"
-        "  return app ? app.get_name() : (win.get_wm_class() || win.get_title());"
-        "})()"
-    )
-    
+    res = subprocess.check_output(
+        [
+            "busctl", "--user", "--json=short", "call",
+            "org.gnome.Shell",
+            "/org/gnome/Shell/Extensions/Windows",
+            "org.gnome.Shell.Extensions.Windows",
+            "List",
+        ],
+        env=env,
+        timeout=2,
+    ).decode()
+
+    outer = json.loads(res)
+    # busctl --json=short argumentlarni massiv ichida qaytaradi: {"type":"s","data":["[...]"]}
+    data_field = outer.get("data")
+    inner_str = data_field[0] if isinstance(data_field, list) else data_field
+    windows = json.loads(inner_str)
+
+    for w in windows:
+        if w.get("focus"):
+            raw = w.get("wm_class") or w.get("wm_class_instance") or w.get("title") or ""
+            return raw
+    return None
+
+
+def get_active_window_name() -> str:
+    """Ayni paytda fokusda turgan (ishlatilayotgan) haqiqiy dasturni aniqlaydi."""
+    env = get_wayland_env()
+
+    # 1-usul: GNOME 'Window Calls' extension orqali (eng ishonchli usul)
     try:
-        cmd = [
-            "gdbus", "call", "--session",
-            "--dest", "org.gnome.Shell",
-            "--object-path", "/org/gnome/Shell",
-            "--method", "org.gnome.Shell.Eval",
-            js_code
-        ]
-        out = subprocess.check_output(cmd, env=env, timeout=2).decode()
-        match = re.search(r"\(true,\s*'(.*?)'\)", out)
-        if match and match.group(1):
-            name = match.group(1).strip()
-            if name:
-                return name
+        raw = get_focused_window_via_extension()
+        if raw and raw.lower() not in SYSTEM_IGNORE_CLASSES:
+            return clean_app_name(raw)
     except Exception:
         pass
 
-    # 2. Zaxira: org.gnome.Shell.Introspect orqali tekshirish
+    # 2-usul: X11/XWayland mosligi orqali faol oyna ID sini olish
     try:
-        res = subprocess.check_output([
-            "gdbus", "call", "--session",
-            "--dest", "org.gnome.Shell.Introspect",
-            "--object-path", "/org/gnome/Shell/Introspect",
-            "--method", "org.gnome.Shell.Introspect.GetWindows"
-        ], env=env, timeout=2).decode()
-
-        match = re.search(r'(\{.*\})', res)
-        if match:
-            data = json.loads(match.group(1))
-            for win_id, props in data.items():
-                if props.get("has-focus") is True:
-                    return props.get("title") or props.get("wm-class") or "Noma'lum"
+        win_id = subprocess.check_output(["xdotool", "getactivewindow"], env=env, timeout=1).decode().strip()
+        if win_id:
+            xprop_out = subprocess.check_output(["xprop", "-id", win_id, "WM_CLASS"], env=env, timeout=1).decode()
+            m = re.search(r'WM_CLASS\(STRING\) =.*?"(.*?)"', xprop_out)
+            if m and m.group(1).lower() not in SYSTEM_IGNORE_CLASSES:
+                return clean_app_name(m.group(1))
     except Exception:
         pass
+
+    # 3-usul: Foydalanuvchi joriy GUI jarayonlari orasidan eng oxirgi ochilgan yoki CPU ishlatayotganini olish
+    current_uid = os.getuid()
+    proc_candidates = []
+
+    for p in psutil.process_iter(['name', 'cmdline', 'uids', 'create_time']):
+        try:
+            info = p.info
+            if not info.get('uids') or info['uids'].real != current_uid:
+                continue
+
+            pname = (info.get('name') or "").lower()
+            cmd = " ".join(info.get('cmdline') or []).lower()
+
+            # Fon tizimlarini chetlab o'tish
+            if pname in ("systemd", "gnome-shell", "dbus-daemon", "pulseaudio", "pipewire", "bash", "python3", "python"):
+                continue
+
+            # Tuzatildi: to'g'ri prefiks tekshiruvi (avval hech qachon ishlamas edi)
+            if pname.startswith(("gsd-", "xdg-", "gvfs")):
+                continue
+
+            # Maxsus dasturlar tekshiruvi
+            if "antigravity" in cmd or "antigravity" in pname:
+                return "Antigravity"
+            elif "pycharm" in cmd:
+                proc_candidates.append(("PyCharm", info['create_time']))
+            elif "code" in pname and "--type=" not in cmd:
+                proc_candidates.append(("VS Code", info['create_time']))
+            elif "chrome" in pname and "--type=" not in cmd:
+                proc_candidates.append(("Google Chrome", info['create_time']))
+            elif "telegram" in pname:
+                proc_candidates.append(("Telegram", info['create_time']))
+            else:
+                proc_candidates.append((pname.capitalize(), info['create_time']))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    if proc_candidates:
+        # Eng oxirgi ishga tushirilganini olish
+        proc_candidates.sort(key=lambda x: x[1], reverse=True)
+        return proc_candidates[0][0]
 
     return "Bosh ekran"
 
@@ -213,7 +303,7 @@ def get_active_window_name() -> str:
 def build_status_text() -> str:
     cpu = round(psutil.cpu_percent(interval=None))
     ram = round(psutil.virtual_memory().percent)
-    
+
     disk = psutil.disk_usage("/")
     free_gb = disk.free / (1024 ** 3)
     disk_text = f"<b>{round(disk.percent)}%</b> ({free_gb:.1f} GB bo'sh)"
@@ -298,7 +388,7 @@ def get_clipboard_text():
 
 def set_clipboard_text(text: str):
     env = get_wayland_env()
-    subprocess.run(["wl-copy", text], env=env, timeout=3, check=True)
+    subprocess.run(["wl-copy", "--", text], env=env, timeout=3, check=True)
 
 
 # ---------- XAVFSIZLIK FILTRI ----------
@@ -318,7 +408,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "🤖 <b>Masofaviy Boshqaruv Markazi</b>\nQuyidagi menyudan foydalaning 👇",
         parse_mode="HTML",
-        reply_markup=main_menu
+        reply_markup=main_menu,
     )
 
 
@@ -350,7 +440,7 @@ async def cmd_photo(message: types.Message):
                 "-S", "25",
                 "--jpeg", "95",
                 "--no-banner",
-                cam_file
+                cam_file,
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -370,12 +460,17 @@ async def cmd_photo(message: types.Message):
 async def cmd_lock(message: types.Message):
     env = get_wayland_env()
     try:
-        subprocess.run([
-            "gdbus", "call", "--session",
-            "--dest", "org.gnome.ScreenSaver",
-            "--object-path", "/org/gnome/ScreenSaver",
-            "--method", "org.gnome.ScreenSaver.Lock"
-        ], env=env, timeout=3, check=True)
+        subprocess.run(
+            [
+                "gdbus", "call", "--session",
+                "--dest", "org.gnome.ScreenSaver",
+                "--object-path", "/org/gnome/ScreenSaver",
+                "--method", "org.gnome.ScreenSaver.Lock",
+            ],
+            env=env,
+            timeout=3,
+            check=True,
+        )
         await message.answer("🔒 Ekran qulflandi!")
     except Exception:
         subprocess.run(["loginctl", "lock-session"])
@@ -394,7 +489,12 @@ async def notify_receive_text(message: types.Message, state: FSMContext):
     await state.clear()
     env = get_wayland_env()
     try:
-        subprocess.run(["notify-send", "-u", "critical", "📩 Telegram Bildirishnomasi", text], env=env, timeout=4, check=True)
+        subprocess.run(
+            ["notify-send", "-u", "critical", "--", text],
+            env=env,
+            timeout=4,
+            check=True,
+        )
         await message.answer("🔔 Xabar noutbuk ekranida ko'rsatildi!", reply_markup=main_menu)
     except Exception as e:
         await message.answer(f"❌ Xatolik: {e}", reply_markup=main_menu)
@@ -554,7 +654,7 @@ async def main():
     await on_startup_notify()
     asyncio.create_task(app_tracker_loop())
     asyncio.create_task(daily_report_scheduler())
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
