@@ -3,6 +3,7 @@ import re
 import asyncio
 import subprocess
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from collections import Counter
 import psutil
 from aiogram import Bot, Dispatcher, types, F
@@ -23,6 +24,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 BOT_TOKEN = "SIZNING_BOT_TOKENINGIZ"
 ADMIN_ID = 123456789  # O'zingizning Telegram raqamli ID'ingiz
 
+# O'zbekiston vaqt mintaqasi (UTC+5)
+UZ_TZ = ZoneInfo("Asia/Tashkent")
+
 # Har necha daqiqada foydalanish statistikasi yig'ilishi (kunlik hisobot uchun)
 TRACK_INTERVAL_MINUTES = 3
 
@@ -42,34 +46,15 @@ class ClipboardState(StatesGroup):
 # ---------- KUNLIK STATISTIKA ----------
 daily_stats = {}
 
-EXCLUDED_PROC_NAMES = {
-    "gnome-shell", "gnome-session-binary", "gnome-terminal-server",
-    "gsd-power", "gsd-media-keys", "gsd-color", "gsd-datetime", "gsd-housekeeping",
-    "gsd-keyboard", "gsd-print-notifications", "gsd-rfkill", "gsd-screensaver-proxy",
-    "gsd-sharing", "gsd-smartcard", "gsd-sound", "gsd-wacom", "gsd-xsettings",
-    "gsd-a11y-settings", "gsd-disk-utility-notify", "gsd-usb-protection", "gsd-wwan",
-    "pulseaudio", "pipewire", "pipewire-pulse", "wireplumber",
-    "dbus-daemon", "dbus-broker", "ibus-daemon", "ibus-x11", "ibus-extension-gtk3",
-    "ibus-engine-simple", "at-spi-bus-launcher", "at-spi2-registryd",
-    "xdg-permission-store", "xdg-desktop-portal", "xdg-desktop-portal-gnome",
-    "xdg-desktop-portal-gtk", "xdg-document-portal",
-    "evolution-source-registry", "evolution-calendar-factory", "evolution-addressbook-factory",
-    "goa-daemon", "goa-identity-service", "gvfsd", "gvfsd-fuse", "gvfsd-trash",
-    "gvfsd-metadata", "gvfs-udisks2-volume-monitor",
-    "tracker-miner-fs-3", "tracker-extract-3", "tracker-store",
-    "geoclue", "fwupd", "upowerd", "polkitd", "udisksd", "accounts-daemon",
-    "packagekitd", "snapd", "systemd", "systemd-logind", "systemd-resolved",
-    "systemd-timesyncd", "systemd-udevd", "cron", "rsyslogd", "avahi-daemon",
-    "cupsd", "bluetoothd", "ModemManager", "NetworkManager", "wpa_supplicant",
-    "chronyd", "irqbalance", "thermald", "networkd-dispatcher",
-    "gjs", "Xwayland", "gdm-session-worker", "gdm3",
-    "ssh-agent", "gpg-agent", "gcr-ssh-agent",
-    "bash", "sh", "zsh", "python3", "python",
+# Hisobotga kirmasligi kerak bo'lgan ichki desktop oyna nomlari
+EXCLUDED_APP_CLASSES = {
+    "gnome-shell", "desktop_window", "nautilus-desktop", 
+    "mutter-x11-frames", "mutter-guard-window", "dock"
 }
 
 
 def reset_daily_stats():
-    daily_stats["date"] = datetime.now().strftime("%Y-%m-%d")
+    daily_stats["date"] = datetime.now(UZ_TZ).strftime("%Y-%m-%d")
     daily_stats["app_counter"] = Counter()
     daily_stats["battery_samples"] = []
 
@@ -77,7 +62,7 @@ def reset_daily_stats():
 # ---------- KLAVIATURALAR ----------
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Status"), KeyboardButton(text="📸 Rasm")],
+        [KeyboardButton(text="📊 Status"), KeyboardButton(text="📸 Rasm"), KeyboardButton(text="🖥 Ekran")],
         [KeyboardButton(text="🔒 Qulflash"), KeyboardButton(text="🔊 Ovoz")],
         [KeyboardButton(text="📋 Clipboard"), KeyboardButton(text="📅 Kunlik hisobot")],
         [KeyboardButton(text="🔔 Bildirishnoma")],
@@ -160,7 +145,7 @@ def get_disk_text() -> str:
 
 
 def build_status_text() -> str:
-    cpu = round(psutil.cpu_percent(interval=1))
+    cpu = round(psutil.cpu_percent(interval=None))
     ram = round(psutil.virtual_memory().percent)
 
     battery = psutil.sensors_battery()
@@ -172,7 +157,7 @@ def build_status_text() -> str:
         bat_text = "Mavjud emas"
 
     try:
-        ip = subprocess.check_output(["curl", "-s", "--max-time", "4", "https://ifconfig.me"]).decode().strip()
+        ip = subprocess.check_output(["curl", "-s", "--max-time", "3", "https://ifconfig.me"]).decode().strip()
     except Exception:
         ip = "Aniqlanmadi"
 
@@ -214,43 +199,75 @@ def run_volume_action(arg: str) -> str:
 
 def get_clipboard_text():
     env = get_gui_env()
+    # 1. Wayland
     try:
-        output = subprocess.check_output(["wl-paste", "--no-newline"], env=env, timeout=4).decode()
-        return output if output else None
+        output = subprocess.check_output(["wl-paste", "--no-newline"], env=env, timeout=3).decode()
+        if output:
+            return output
     except Exception:
-        return None
+        pass
+
+    # 2. X11
+    try:
+        output = subprocess.check_output(["xclip", "-selection", "clipboard", "-o"], env=env, timeout=3).decode()
+        if output:
+            return output
+    except Exception:
+        pass
+
+    return None
 
 
 def set_clipboard_text(text: str):
     env = get_gui_env()
-    subprocess.run(["wl-copy", text], env=env, timeout=4, check=True)
+    try:
+        subprocess.run(["wl-copy", text], env=env, timeout=3, check=True)
+        return
+    except Exception:
+        pass
+
+    try:
+        p = subprocess.Popen(["xclip", "-selection", "clipboard"], env=env, stdin=subprocess.PIPE)
+        p.communicate(input=text.encode())
+    except Exception as e:
+        raise e
 
 
 def get_active_app_names():
-    """Foydalanuvchi grafik dasturlarining nomlarini taxminan aniqlaydi
-    (terminalsiz, joriy foydalanuvchi nomidan ishlayotgan jarayonlar)."""
+    """Faqat foydalanuvchi ekranda ochgan haqiqiy GUI ilovalarini aniqlaydi."""
     apps = set()
-    current_uid = os.getuid()
-    for p in psutil.process_iter(["name", "uids", "terminal"]):
+    env = get_gui_env()
+    
+    # 1-usul: Ochiq oynalar ro'yxatidan aniqlash (wmctrl)
+    try:
+        output = subprocess.check_output(["wmctrl", "-lx"], env=env, timeout=3).decode()
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                wm_class = parts[2].split(".")[-1]
+                if wm_class.lower() not in EXCLUDED_APP_CLASSES:
+                    clean_name = wm_class.replace("-", " ").capitalize()
+                    apps.add(clean_name)
+    except Exception:
+        pass
+
+    # 2-usul: Zaxira sifatida ayni paytda faol oynani olish (xdotool)
+    if not apps:
         try:
-            info = p.info
-            uids = info.get("uids")
-            if uids and uids.real != current_uid:
-                continue
-            if info.get("terminal") is not None:
-                continue
-            name = info.get("name")
-            if not name or name in EXCLUDED_PROC_NAMES:
-                continue
-            apps.add(name)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+            win_id = subprocess.check_output(["xdotool", "getactivewindow"], env=env, timeout=2).decode().strip()
+            if win_id:
+                app_name = subprocess.check_output(["xdotool", "getwindowname", win_id], env=env, timeout=2).decode().strip()
+                if app_name:
+                    apps.add(app_name[:30])
+        except Exception:
+            pass
+
     return apps
 
 
 def build_daily_report_text() -> str:
     stats = daily_stats
-    date_str = stats.get("date", datetime.now().strftime("%Y-%m-%d"))
+    date_str = stats.get("date", datetime.now(UZ_TZ).strftime("%Y-%m-%d"))
     battery_samples = stats.get("battery_samples", [])
 
     if battery_samples:
@@ -270,7 +287,7 @@ def build_daily_report_text() -> str:
     top_apps = stats.get("app_counter", Counter()).most_common(5)
     if top_apps:
         apps_lines = "\n".join(
-            f"{i + 1}. {name} — ~{count * TRACK_INTERVAL_MINUTES} daqiqa"
+            f"{i + 1}. <b>{name}</b> — ~{count * TRACK_INTERVAL_MINUTES} daqiqa"
             for i, (name, count) in enumerate(top_apps)
         )
     else:
@@ -340,12 +357,36 @@ async def cmd_photo(message: types.Message):
         await message.answer(f"❌ Kamera xatoligi: {e}")
 
 
+# ---------- SCREENSHOT ----------
+@dp.message(Command("screenshot"))
+@dp.message(F.text == "🖥 Ekran")
+async def cmd_screenshot(message: types.Message):
+    msg = await message.answer("🖥 Ekran tasviri olinmoqda...")
+    screen_file = "/tmp/screenshot.png"
+
+    if os.path.exists(screen_file):
+        os.remove(screen_file)
+
+    env = get_gui_env()
+    try:
+        subprocess.run(["scrot", screen_file], env=env, timeout=4, check=True)
+    except Exception:
+        pass
+
+    if os.path.exists(screen_file) and os.path.getsize(screen_file) > 0:
+        photo = FSInputFile(screen_file)
+        await message.answer_photo(photo, caption="🖥 Ekran surati")
+        os.remove(screen_file)
+        await msg.delete()
+    else:
+        await message.answer("❌ Ekran tasvirini olib bo'lmadi.")
+
+
 # ---------- LOCK ----------
 @dp.message(Command("lock"))
 @dp.message(F.text == "🔒 Qulflash")
 async def cmd_lock(message: types.Message):
     env = get_gui_env()
-
     try:
         subprocess.run(
             [
@@ -364,7 +405,7 @@ async def cmd_lock(message: types.Message):
         await message.answer("🔒 Ekran qulflandi!")
 
 
-# ---------- NOTIFY (tugma orqali, matn so'raladi) ----------
+# ---------- NOTIFY ----------
 @dp.message(F.text == "🔔 Bildirishnoma")
 async def notify_button(message: types.Message, state: FSMContext):
     await state.set_state(NotifyState.waiting_text)
@@ -384,7 +425,6 @@ async def notify_receive_text(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Bildirishnoma xatoligi: {e}", reply_markup=main_menu)
 
 
-# ---------- NOTIFY (buyruq orqali: /notify matn) ----------
 @dp.message(Command("notify"))
 async def cmd_notify(message: types.Message, command: CommandObject):
     text = command.args
@@ -400,7 +440,7 @@ async def cmd_notify(message: types.Message, command: CommandObject):
         await message.answer(f"❌ Bildirishnoma xatoligi: {e}")
 
 
-# ---------- VOLUME (tugma orqali menyu ko'rsatish) ----------
+# ---------- VOLUME ----------
 @dp.message(F.text == "🔊 Ovoz")
 async def volume_button(message: types.Message):
     volume = get_current_volume_percent()
@@ -410,7 +450,6 @@ async def volume_button(message: types.Message):
     await message.answer(text, parse_mode="HTML", reply_markup=volume_kb)
 
 
-# ---------- VOLUME (/volume up|down|mute) ----------
 @dp.message(Command("volume"))
 async def cmd_volume(message: types.Message, command: CommandObject):
     arg = (command.args or "").strip().lower()
@@ -432,7 +471,6 @@ async def cmd_volume(message: types.Message, command: CommandObject):
         await message.answer(f"❌ Ovoz sozlash xatoligi: {e}")
 
 
-# ---------- VOLUME (inline tugmalar bosilganda) ----------
 @dp.callback_query(F.data.in_({"vol_up", "vol_down", "vol_mute"}))
 async def volume_callback(callback: CallbackQuery):
     action_map = {"vol_up": "up", "vol_down": "down", "vol_mute": "mute"}
@@ -447,7 +485,7 @@ async def volume_callback(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------- CLIPBOARD (tugma orqali menyu ko'rsatish) ----------
+# ---------- CLIPBOARD ----------
 @dp.message(F.text == "📋 Clipboard")
 async def clipboard_button(message: types.Message):
     await message.answer("📋 Nima qilmoqchisiz?", reply_markup=clipboard_kb)
@@ -458,7 +496,7 @@ async def clipboard_get_callback(callback: CallbackQuery):
     await callback.answer()
     text = get_clipboard_text()
     if text:
-        await callback.message.answer(f"📥 <b>Clipboard tarkibi:</b>\n\n{text}", parse_mode="HTML")
+        await callback.message.answer(f"📥 <b>Clipboard tarkibi:</b>\n\n<code>{text}</code>", parse_mode="HTML")
     else:
         await callback.message.answer("📋 Clipboard bo'sh yoki o'qib bo'lmadi.")
 
@@ -482,13 +520,13 @@ async def clipboard_receive_text(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Xatolik: {e}", reply_markup=main_menu)
 
 
-# ---------- KUNLIK HISOBOT (tugma orqali) ----------
+# ---------- KUNLIK HISOBOT ----------
 @dp.message(F.text == "📅 Kunlik hisobot")
 async def daily_report_button(message: types.Message):
     await message.answer(build_daily_report_text(), parse_mode="HTML")
 
 
-# ---------- REBOOT (tasdiqlash bilan) ----------
+# ---------- REBOOT & SHUTDOWN ----------
 @dp.message(Command("reboot"))
 @dp.message(F.text == "🔄 Qayta ishga tushirish")
 async def cmd_reboot(message: types.Message):
@@ -498,7 +536,6 @@ async def cmd_reboot(message: types.Message):
     )
 
 
-# ---------- SHUTDOWN (tasdiqlash bilan) ----------
 @dp.message(Command("shutdown"))
 @dp.message(F.text == "🛑 O'chirish")
 async def cmd_shutdown(message: types.Message):
@@ -508,7 +545,6 @@ async def cmd_shutdown(message: types.Message):
     )
 
 
-# ---------- TASDIQLASH TUGMALARI ----------
 @dp.callback_query(F.data == "confirm_reboot")
 async def confirm_reboot(callback: CallbackQuery):
     await callback.message.edit_text("🔄 Noutbuk qayta ishga tushirilmoqda...")
@@ -531,10 +567,9 @@ async def cancel_action(callback: CallbackQuery):
 
 # ---------- FONDA ISHLAYDIGAN VAZIFALAR ----------
 async def usage_tracker_loop():
-    """Har TRACK_INTERVAL_MINUTES daqiqada batareya va ochiq ilovalarni kuzatadi."""
     while True:
         try:
-            today_str = datetime.now().strftime("%Y-%m-%d")
+            today_str = datetime.now(UZ_TZ).strftime("%Y-%m-%d")
             if daily_stats.get("date") != today_str:
                 reset_daily_stats()
 
@@ -554,27 +589,27 @@ async def usage_tracker_loop():
 
 
 async def daily_report_scheduler():
-    """Har kuni soat 23:55 da kunlik hisobotni avtomatik yuboradi."""
+    """Toshkent vaqti bilan har kuni soat 23:55 da hisobot yuboradi."""
+    sent_today = False
     while True:
-        now = datetime.now()
-        target = now.replace(hour=23, minute=55, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
+        now = datetime.now(UZ_TZ)
+        if now.hour == 23 and now.minute >= 55 and not sent_today:
+            try:
+                report_text = build_daily_report_text()
+                await bot.send_message(chat_id=ADMIN_ID, text=report_text, parse_mode="HTML")
+                sent_today = True
+                reset_daily_stats()
+            except Exception:
+                pass
+        elif now.hour == 0:
+            sent_today = False
 
-        try:
-            report_text = build_daily_report_text()
-            await bot.send_message(chat_id=ADMIN_ID, text=report_text, parse_mode="HTML")
-        except Exception:
-            pass
-
-        reset_daily_stats()
+        await asyncio.sleep(30)
 
 
 # ---------- STARTUP XABARI ----------
 async def on_startup_notify():
-    boot_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    boot_time = datetime.now(UZ_TZ).strftime("%Y-%m-%d %H:%M:%S")
     battery = psutil.sensors_battery()
     bat_text = f"{round(battery.percent)}%" if battery else "Aniqlanmadi"
 
