@@ -21,8 +21,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+BOT_TOKEN = 1234214
+ADMIN_ID = 1324123412
 
 UZ_TZ = ZoneInfo("Asia/Tashkent")
 TRACK_INTERVAL_SECONDS = 60  # Har 1 daqiqada faol dasturni hisoblaydi
